@@ -26,19 +26,18 @@ func (h *customheaders) Set(val string) error {
 
 var (
 	headers     customheaders
-	paramFile   string
+	paramList   string
 	payload     string
 	matchStr    string
 	proxy       string
 	onlyPOC     bool
 	htmlOnly    bool
 	concurrency int
-	paramCount  int
 	wordlist    []string
 )
 
 func init() {
-	flag.StringVar(&paramFile, "lp", "", "Path to parameter list file (wordlist)")
+	flag.StringVar(&paramList, "lp", "", "Parameters separated by comma (e.g., blog,login,embed)")
 	flag.StringVar(&payload, "p", "", "Payload to append")
 	flag.StringVar(&matchStr, "m", "", "String to match in response body")
 	flag.StringVar(&proxy, "x", "", "Proxy URL")
@@ -46,7 +45,6 @@ func init() {
 	flag.BoolVar(&htmlOnly, "html", false, "Only match if response is HTML")
 	flag.Var(&headers, "H", "Add headers")
 	flag.IntVar(&concurrency, "t", 50, "Number of threads (minimum 15)")
-	flag.IntVar(&paramCount, "params", 0, "Number of words to randomly pick from wordlist (1 per request)")
 }
 
 func main() {
@@ -54,19 +52,15 @@ func main() {
 	if concurrency < 15 {
 		concurrency = 15
 	}
-	if paramFile == "" || payload == "" || matchStr == "" || paramCount <= 0 {
-		fmt.Println("Missing required parameters: -lp, -p, -m, -params")
+	if paramList == "" || payload == "" || matchStr == "" {
+		fmt.Println("Missing required parameters: -lp, -p, -m")
 		os.Exit(1)
 	}
 
-	var err error
-	wordlist, err = readLines(paramFile)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "Failed to read wordlist:", err)
-		os.Exit(1)
-	}
+	// Parse comma-separated parameters
+	wordlist = parseParams(paramList)
 	if len(wordlist) == 0 {
-		fmt.Fprintln(os.Stderr, "Wordlist is empty")
+		fmt.Fprintln(os.Stderr, "Parameters list is empty")
 		os.Exit(1)
 	}
 
@@ -81,8 +75,8 @@ func main() {
 		go func() {
 			defer wg.Done()
 			for baseURL := range targets {
-				selected := getRandomWords(wordlist, paramCount)
-				for _, word := range selected {
+				// Use all parameters from the list
+				for _, word := range wordlist {
 					fullURL := strings.TrimRight(baseURL, "/") + "/" + word + "/" + payload
 					testURL(fullURL)
 				}
@@ -100,16 +94,16 @@ func main() {
 	wg.Wait()
 }
 
-func getRandomWords(words []string, count int) []string {
-	if count >= len(words) {
-		return words
+func parseParams(paramStr string) []string {
+	var params []string
+	parts := strings.Split(paramStr, ",")
+	for _, part := range parts {
+		param := strings.TrimSpace(part)
+		if param != "" {
+			params = append(params, param)
+		}
 	}
-	shuffled := make([]string, len(words))
-	copy(shuffled, words)
-	rand.Shuffle(len(shuffled), func(i, j int) {
-		shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
-	})
-	return shuffled[:count]
+	return params
 }
 
 func testURL(testURL string) {
@@ -166,22 +160,4 @@ func applyHeaders(req *http.Request) {
 			req.Header.Set(strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]))
 		}
 	}
-}
-
-func readLines(path string) ([]string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	var lines []string
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line != "" {
-			lines = append(lines, line)
-		}
-	}
-	return lines, scanner.Err()
 }
