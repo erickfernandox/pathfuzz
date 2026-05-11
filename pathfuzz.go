@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/tls"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -30,6 +32,7 @@ var (
 	payload     string
 	matchStr    string
 	proxy       string
+	method      string
 	onlyPOC     bool
 	htmlOnly    bool
 	concurrency int
@@ -37,67 +40,143 @@ var (
 )
 
 func init() {
-	flag.StringVar(&paramList, "lp", "", "Parameters separated by comma (e.g., blog,login,embed)")
-	flag.StringVar(&payload, "p", "", "Payload to append")
+	flag.StringVar(&paramList, "lp", "", "URL paths separated by comma (e.g., blog,login,embed)")
+	flag.StringVar(&payload, "p", "", "Query params cluster (e.g., ?url=XXX&user=XSS)")
 	flag.StringVar(&matchStr, "m", "", "String to match in response body")
 	flag.StringVar(&proxy, "x", "", "Proxy URL")
+	flag.StringVar(&method, "X", "", "HTTP method: GET, POST or PUT (default: all three)")
 	flag.BoolVar(&onlyPOC, "s", false, "Show only PoC output")
 	flag.BoolVar(&htmlOnly, "html", false, "Only match if response is HTML")
-	flag.Var(&headers, "H", "Add headers")
+	flag.Var(&headers, "H", "Add headers (can be used multiple times)")
 	flag.IntVar(&concurrency, "t", 50, "Number of threads (minimum 15)")
+}
+
+// parsePayload parses "?url=XXX&user=XSS" or "url=XXX&user=XSS"
+// into a map of key -> value
+func parsePayload(p string) map[string]string {
+	p = strings.TrimPrefix(p, "?")
+	params := map[string]string{}
+	for _, part := range strings.Split(p, "&") {
+		kv := strings.SplitN(part, "=", 2)
+		if len(kv) == 2 {
+			params[strings.TrimSpace(kv[0])] = strings.TrimSpace(kv[1])
+		}
+	}
+	return params
+}
+
+// buildGETURL appends params as query string to the URL
+func buildGETURL(base string, params map[string]string) string {
+	u, err := url.Parse(base)
+	if err != nil {
+		return base
+	}
+	q := u.Query()
+	for k, v := range params {
+		q.Set(k, v)
+	}
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+// buildFormBody encodes params as application/x-www-form-urlencoded
+func buildFormBody(params map[string]string) (io.Reader, string) {
+	form := url.Values{}
+	for k, v := range params {
+		form.Set(k, v)
+	}
+	return strings.NewReader(form.Encode()), "application/x-www-form-urlencoded"
+}
+
+// buildJSONBody encodes params as JSON
+func buildJSONBody(params map[string]string) (io.Reader, string) {
+	// convert map[string]string to map[string]interface{} for cleaner JSON
+	m := make(map[string]interface{}, len(params))
+	for k, v := range params {
+		m[k] = v
+	}
+	b, _ := json.Marshal(m)
+	return bytes.NewReader(b), "application/json"
 }
 
 func main() {
 	flag.Parse()
+
 	if concurrency < 15 {
 		concurrency = 15
 	}
+
+	var methods []string
+	if method == "" {
+		methods = []string{"GET", "POST", "PUT"}
+	} else {
+		m := strings.ToUpper(strings.TrimSpace(method))
+		if m != "GET" && m != "POST" && m != "PUT" {
+			fmt.Fprintf(os.Stderr, "Invalid method '%s'. Use GET, POST or PUT.\n", method)
+			os.Exit(1)
+		}
+		methods = []string{m}
+	}
+
 	if paramList == "" || payload == "" || matchStr == "" {
 		fmt.Println("Missing required parameters: -lp, -p, -m")
 		os.Exit(1)
 	}
 
-	// Parse comma-separated parameters
 	wordlist = parseParams(paramList)
 	if len(wordlist) == 0 {
 		fmt.Fprintln(os.Stderr, "Parameters list is empty")
 		os.Exit(1)
 	}
 
+	payloadParams := parsePayload(payload)
+	if len(payloadParams) == 0 {
+		fmt.Fprintln(os.Stderr, "Could not parse payload params. Use format: ?key=val&key2=val2")
+		os.Exit(1)
+	}
+
 	rand.Seed(time.Now().UnixNano())
 
+	type task struct {
+		baseURL string
+		word    string
+		method  string
+	}
+
 	stdin := bufio.NewScanner(os.Stdin)
-	targets := make(chan string)
+	targets := make(chan task)
 	var wg sync.WaitGroup
 
 	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for baseURL := range targets {
-				// Use all parameters from the list
-				for _, word := range wordlist {
-					fullURL := strings.TrimRight(baseURL, "/") + "/" + word + "/" + payload
-					testURL(fullURL)
-				}
+			for t := range targets {
+				base := strings.TrimRight(t.baseURL, "/") + "/" + t.word
+				testURL(base, t.method, payloadParams)
 			}
 		}()
 	}
 
 	for stdin.Scan() {
-		url := strings.TrimSpace(stdin.Text())
-		if url != "" {
-			targets <- url
+		u := strings.TrimSpace(stdin.Text())
+		if u == "" {
+			continue
+		}
+		for _, word := range wordlist {
+			for _, m := range methods {
+				targets <- task{baseURL: u, word: word, method: m}
+			}
 		}
 	}
+
 	close(targets)
 	wg.Wait()
 }
 
 func parseParams(paramStr string) []string {
 	var params []string
-	parts := strings.Split(paramStr, ",")
-	for _, part := range parts {
+	for _, part := range strings.Split(paramStr, ",") {
 		param := strings.TrimSpace(part)
 		if param != "" {
 			params = append(params, param)
@@ -106,12 +185,42 @@ func parseParams(paramStr string) []string {
 	return params
 }
 
-func testURL(testURL string) {
+func testURL(baseURL, method string, params map[string]string) {
 	client := buildClient()
-	req, err := http.NewRequest("GET", testURL, nil)
+
+	var (
+		reqURL      string
+		reqBody     io.Reader
+		contentType string
+	)
+
+	switch method {
+	case "GET":
+		// params go in the query string
+		reqURL = buildGETURL(baseURL, params)
+		reqBody = nil
+		contentType = ""
+
+	case "POST":
+		// params go in the body as form-urlencoded
+		reqURL = baseURL
+		reqBody, contentType = buildFormBody(params)
+
+	case "PUT":
+		// params go in the body as JSON
+		reqURL = baseURL
+		reqBody, contentType = buildJSONBody(params)
+	}
+
+	req, err := http.NewRequest(method, reqURL, reqBody)
 	if err != nil {
 		return
 	}
+
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+
 	applyHeaders(req)
 
 	resp, err := client.Do(req)
@@ -124,15 +233,16 @@ func testURL(testURL string) {
 		return
 	}
 
-	body, _ := io.ReadAll(resp.Body)
-	if strings.Contains(string(body), matchStr) {
+	respBody, _ := io.ReadAll(resp.Body)
+
+	if strings.Contains(string(respBody), matchStr) {
 		if onlyPOC {
-			fmt.Println(testURL)
+			fmt.Printf("[%s] %s\n", method, reqURL)
 		} else {
-			fmt.Printf("\033[1;31m[+] Match Found: %s\033[0;0m\n", testURL)
+			fmt.Printf("\033[1;31m[+] Match Found [%s] %s\033[0;0m\n", method, reqURL)
 		}
 	} else if !onlyPOC {
-		fmt.Printf("\033[1;30m[-] Not Vulnerable: %s\033[0;0m\n", testURL)
+		fmt.Printf("\033[1;30m[-] Not Vulnerable [%s] %s\033[0;0m\n", method, reqURL)
 	}
 }
 
